@@ -16,7 +16,7 @@ nest_asyncio.apply()
 # ------------------------------------------------------------------
 # CONFIGURATION
 # ------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = "8712072214:AAEJl5SW1TPisPZb7tiQbYolv-QlDvo_tTU"
+TELEGRAM_BOT_TOKEN = "8687902424:AAEVFOrz4dPnr2Vvj3kyA000QGc3mhelp3k"
 VOICE = "hi-IN-MadhurNeural"
 RATE = "+30%"
 VOLUME = "+20%"
