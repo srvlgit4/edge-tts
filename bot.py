@@ -1,61 +1,66 @@
 import os
 import time
 import subprocess
-import telebot
 import asyncio
 import edge_tts
 import nest_asyncio
 import re
 import random
+import tempfile
+import shutil
+import logging
+from pathlib import Path
+from threading import Thread
 from flask import Flask
-import threading
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Fix asyncio for multi-threading environments
+# Apply nest_asyncio
 nest_asyncio.apply()
 
-# ------------------------------------------------------------------
+# ==========================================
 # CONFIGURATION
-# ------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = "8687902424:AAEVFOrz4dPnr2Vvj3kyA000QGc3mhelp3k"
+# ==========================================
+TELEGRAM_BOT_TOKEN = "8712072214:AAEJl5SW1TPisPZb7tiQbYolv-QlDvo_tTU"
 VOICE = "hi-IN-MadhurNeural"
 RATE = "+30%"
 VOLUME = "+20%"
+MAX_CONCURRENT_DOWNLOADS = 5  # Safer for Cloud IPs
+CHUNK_SIZE = 2500
+EPISODE_SIZE = 35000
 
-# STEALTH CONFIG: Lowering to 3 lanes is safer for Render's shared IPs
-MAX_CONCURRENT_DOWNLOADS = 4 
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-
-# ------------------------------------------------------------------
-# RENDER "STAY ALIVE" WEB SERVER
-# ------------------------------------------------------------------
+# ==========================================
+# KOYEB HEALTH CHECK SERVER
+# ==========================================
 app = Flask(__name__)
 
 @app.route('/')
-def home():
-    return "Edge TTS Bot is awake and running!"
+def health_check():
+    return "Edge TTS Bot is Alive!", 200
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+def run_flask():
+    # Koyeb default port is 8080
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
-threading.Thread(target=run_web_server, daemon=True).start()
+# Start Flask in background thread
+Thread(target=run_flask, daemon=True).start()
 
-print("⚡ Ultimate Stealth Bot with Upload-Retry is LIVE!")
-
-# ------------------------------------------------------------------
-# CORE LOGIC
-# ------------------------------------------------------------------
+# ==========================================
+# CORE FUNCTIONS
+# ==========================================
 def clean_text(text):
-    """Protects Hindi characters and removes server-crashing symbols."""
+    if not text: return ""
     text = text.replace("\n", " ").replace("अध्याय", "\nअध्याय").replace(",\n", " ")
-    # Nuclear Filter: Keep Devanagari, Joiners, and basic punctuation
-    text = re.sub(r'[^\w\s\.\,\!\?\"\'।\u200C\u200D\u0900-\u097F]', ' ', text)
+    text = re.sub(r'[^\w\s\.\,\!\?\"\'।\u200C\u200D\u0900-\u097F\-]', ' ', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 def split_text_by_length(text, max_chars):
-    """Smart sentence chunking to prevent mid-word cuts."""
     sentences = re.split(r'(?<=[।?!.\n])\s+', text)
     chunks = []
     current_chunk = ""
@@ -65,132 +70,142 @@ def split_text_by_length(text, max_chars):
         else:
             chunks.append(current_chunk.strip())
             current_chunk = sentence + " "
-    if current_chunk:
-        chunks.append(current_chunk.strip())
+    if current_chunk: chunks.append(current_chunk.strip())
     return chunks
 
-async def tts_chunk(text, filename):
-    communicate = edge_tts.Communicate(text=text, voice=VOICE, rate=RATE, volume=VOLUME)
-    await communicate.save(filename)
+def get_progress_bar(completed, total, bar_length=10):
+    filled_len = int(round(bar_length * completed / float(total)))
+    percents = round(100.0 * completed / float(total), 1)
+    bar = '█' * filled_len + '░' * (bar_length - filled_len)
+    return f"[{bar}] {percents}%"
 
-async def process_episode_strict_dealer(chunk_data_list):
-    """Parallel downloader with IP-protection delays."""
+async def tts_chunk(text, filename, timeout=120):
+    try:
+        communicate = edge_tts.Communicate(text=text, voice=VOICE, rate=RATE, volume=VOLUME)
+        await asyncio.wait_for(communicate.save(filename), timeout=timeout)
+        return True
+    except Exception as e:
+        logger.warning(f"TTS error: {e}")
+        return False
+
+async def process_episode_strict_dealer(chunk_data_list, status_msg, episode_num, total_episodes):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     tasks = []
+    completed_chunks = 0
+    last_update_time = 0
 
     async def strict_worker(chunk_txt, chunk_mp3, chunk_idx, total_chunks):
-        async with semaphore: 
-            for attempt in range(1, 6): 
+        nonlocal completed_chunks, last_update_time
+        async with semaphore:
+            for attempt in range(1, 6):
                 try:
-                    print(f"   -> 🟢 Processing Chunk {chunk_idx}/{total_chunks} (Attempt {attempt})...")
-                    await tts_chunk(chunk_txt, chunk_mp3)
-                    return 
+                    # Update progress every 2 seconds to avoid Telegram Flood Limits
+                    if time.time() - last_update_time > 2.0:
+                        bar = get_progress_bar(completed_chunks, total_chunks)
+                        await status_msg.edit_text(
+                            f"🎙️ **Episode {episode_num}/{total_episodes}**\n"
+                            f"⚡ Status: Generating Audio\n"
+                            f"📊 Progress: {bar}\n"
+                            f"📦 Chunk: {chunk_idx}/{total_chunks} (Try {attempt})\n"
+                            f"📝 Preview: {chunk_txt[:40]}..."
+                        )
+                        last_update_time = time.time()
+
+                    success = await tts_chunk(chunk_txt, chunk_mp3)
+                    if success:
+                        completed_chunks += 1
+                        return True
+                    await asyncio.sleep(5)
                 except Exception as e:
-                    print(f"   -> ⚠️ Chunk {chunk_idx} failed: {e}. Retrying in 10s...")
                     await asyncio.sleep(10)
-            raise Exception(f"❌ Chunk {chunk_idx} failed after 5 attempts.")
+            return False
 
     for index, (text, filename, idx, total) in enumerate(chunk_data_list):
         task = asyncio.create_task(strict_worker(text, filename, idx, total))
         tasks.append(task)
         if index < len(chunk_data_list) - 1:
-            # Safer randomized delay for long-term stability
-            delay = random.randint(10, 15) 
-            await asyncio.sleep(delay)
+            await asyncio.sleep(random.randint(8, 13))
 
-    await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    successful_files = [chunk_data_list[i][1] for i, res in enumerate(results) if res is True]
+    return successful_files
 
-# ------------------------------------------------------------------
+# ==========================================
 # TELEGRAM HANDLERS
-# ------------------------------------------------------------------
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "👋 **Welcome!**\nSend me a `.txt` file containing your novel, and I will convert it to a high-quality Hindi audiobook.")
+# ==========================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 **Koyeb Ready!**\nSend me a `.txt` novel file to begin.")
 
-@bot.message_handler(content_types=['document'])
-def handle_novel_upload(message):
-    chat_id = message.chat.id
-    if not message.document.file_name.endswith('.txt'):
-        bot.reply_to(message, "❌ Please send a `.txt` file.")
-        return
-
-    bot.send_message(chat_id, "📥 Processing file...")
-    
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        file_info = bot.get_file(message.document.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
+        doc = update.message.document
+        chat_id = update.message.chat_id
+        if not doc.file_name.lower().endswith('.txt'): return
         
-        raw_text = ""
-        for enc in ['utf-8', 'utf-16', 'cp1252']:
-            try:
-                raw_text = downloaded_file.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
+        status_msg = await update.message.reply_text("📥 Downloading...")
+        file = await context.bot.get_file(doc.file_id)
+        file_content = await file.download_as_bytearray()
+        
+        try: text = file_content.decode('utf-8')
+        except: text = file_content.decode('latin-1')
+        
+        story_text = clean_text(text)
+        episodes = split_text_by_length(story_text, EPISODE_SIZE)
+        await status_msg.edit_text(f"📖 Sliced into {len(episodes)} episodes. Processing...")
 
-        story_text = clean_text(raw_text)
-        episodes = split_text_by_length(story_text, max_chars=30000)
-        bot.send_message(chat_id, f"📖 Found {len(episodes)} episodes. Starting conversion...")
+        temp_dir = tempfile.mkdtemp()
+        sent_episodes = 0
         
-        for ep_idx, episode_text in enumerate(episodes):
-            episode_num = ep_idx + 1
-            start_time = time.time()
-            
-            # Network chunks at 1500 chars for Hindi byte-safety
-            network_chunks = split_text_by_length(episode_text, max_chars=1500)
-            list_file_path = f"list_{episode_num}.txt"
-            final_mp3 = f"Episode_{episode_num}.mp3"
-            
-            chunk_data = []
-            chunk_files_to_delete = []
-            
-            try:
-                print(f"\n🎙️ STARTING EPISODE {episode_num}")
-                with open(list_file_path, "w", encoding="utf-8") as list_file:
-                    for chunk_idx, chunk_txt in enumerate(network_chunks):
-                        chunk_mp3 = f"ep_{episode_num}_part_{chunk_idx}.mp3"
-                        chunk_data.append((chunk_txt, chunk_mp3, chunk_idx + 1, len(network_chunks)))
-                        chunk_files_to_delete.append(chunk_mp3)
-                        list_file.write(f"file '{chunk_mp3}'\n")
+        try:
+            for ep_idx, episode_text in enumerate(episodes):
+                episode_num = ep_idx + 1
+                start_time = time.time()
+                network_chunks = split_text_by_length(episode_text, CHUNK_SIZE)
                 
-                asyncio.run(process_episode_strict_dealer(chunk_data))
+                chunk_data = []
+                for idx, txt in enumerate(network_chunks):
+                    path = os.path.join(temp_dir, f"ep_{episode_num}_p{idx}.mp3")
+                    chunk_data.append((txt, path, idx + 1, len(network_chunks)))
                 
-                # Glue chunks with FFmpeg
-                subprocess.run([
-                    "ffmpeg", "-f", "concat", "-safe", "0", 
-                    "-i", list_file_path, "-c", "copy", final_mp3, "-y"
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                successful_chunks = await process_episode_strict_dealer(chunk_data, status_msg, episode_num, len(episodes))
                 
-                gen_time = round(time.time() - start_time, 1)
+                # Glue
+                list_path = os.path.join(temp_dir, f"list_{episode_num}.txt")
+                final_mp3 = os.path.join(temp_dir, f"Ep_{episode_num}.mp3")
+                with open(list_path, "w", encoding="utf-8") as f:
+                    for cf in successful_chunks: f.write(f"file '{cf}'\n")
                 
-                # --- UPLOAD WITH RETRY LOOP ---
-                print(f"📤 Uploading Episode {episode_num}...")
-                for upload_attempt in range(1, 4):
-                    try:
-                        with open(final_mp3, 'rb') as audio_data:
-                            caption = f"🎧 **Episode {episode_num}**\n⚡ Speed: +30%\n⏱️ Generated in {gen_time}s"
-                            bot.send_audio(chat_id, audio_data, title=f"Episode {episode_num}", performer="Edge TTS", caption=caption, parse_mode="Markdown")
-                            print(f"✅ Episode {episode_num} delivered!")
-                            break 
-                    except Exception as upload_err:
-                        print(f"   ⚠️ Upload failed (Attempt {upload_attempt}): {upload_err}")
-                        if upload_attempt == 3:
-                            raise Exception("Telegram upload failed after 3 attempts.")
-                        time.sleep(5)
+                await status_msg.edit_text(f"🔧 Gluing Episode {episode_num}...")
+                proc = await asyncio.create_subprocess_exec("ffmpeg", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", final_mp3, "-y", stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                await proc.communicate()
                 
-            except Exception as e:
-                bot.send_message(chat_id, f"❌ Error on Episode {episode_num}: {str(e)}")
-                break
-                
-            finally:
-                if os.path.exists(final_mp3): os.remove(final_mp3)
-                if os.path.exists(list_file_path): os.remove(list_file_path)
-                for cf in chunk_files_to_delete:
+                # Upload
+                if os.path.exists(final_mp3):
+                    await status_msg.edit_text(f"📤 Uploading Episode {episode_num}...")
+                    with open(final_mp3, 'rb') as audio:
+                        caption = f"🎧 **Episode {episode_num}**\n⏱️ Time: {round(time.time()-start_time, 1)}s"
+                        await context.bot.send_audio(chat_id=chat_id, audio=audio, title=f"Episode {episode_num}", performer="Edge TTS", caption=caption, read_timeout=600, write_timeout=600)
+                    sent_episodes += 1
+
+                # Episode Cleanup
+                for cf in successful_chunks: 
                     if os.path.exists(cf): os.remove(cf)
-                    
-        bot.send_message(chat_id, "✅ Conversion Task Finished.")
+                if os.path.exists(list_path): os.remove(list_path)
+                if os.path.exists(final_mp3): os.remove(final_mp3)
+                
+            await status_msg.edit_text(f"✅ Finished! Total episodes: {sent_episodes}")
 
+        finally:
+            if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+            
     except Exception as e:
-        bot.reply_to(message, f"❌ Fatal Error: {str(e)}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
-bot.infinity_polling()
+def main():
+    app_bot = Application.builder().token(TELEGRAM_BOT_TOKEN).read_timeout(600).write_timeout(600).build()
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app_bot.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
