@@ -1,17 +1,22 @@
 FROM python:3.10-slim
 
-# Install FFmpeg and clean up to keep image small
-RUN apt-get update && \
-    apt-get install -y ffmpeg && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+# Install FFmpeg
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Create a user (Hugging Face requirement)
+RUN useradd -m -u 1000 user
+USER user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH
 
-COPY requirements.txt .
+WORKDIR $HOME/app
+
+# Copy and install requirements
+COPY --chown=user requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Copy the rest of the code
+COPY --chown=user . .
 
 # Run the bot
 CMD ["python", "bot.py"]
